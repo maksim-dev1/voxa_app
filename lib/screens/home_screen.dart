@@ -9,6 +9,7 @@ import '../services/logger.dart';
 import '../services/recording_session.dart';
 import '../services/recordings_repository.dart';
 import '../services/system_audio_recorder.dart';
+import '../widgets/recording_indicator.dart';
 import '../widgets/waveform_view.dart';
 
 const _tag = 'HomeScreen';
@@ -27,33 +28,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Recording> _recordings = [];
   final Map<String, List<double>> _waveforms = {};
-
-  bool _isRecording = false;
-  bool _isProcessing = false;
   bool _loading = true;
-  String? _error;
-
-  Timer? _elapsedTimer;
-  Duration _elapsed = Duration.zero;
-
-  StreamSubscription<double>? _micLevelSub;
-  Timer? _systemLevelTimer;
-  double _micLevel = 0;
-  double _systemLevel = 0;
-
-  // Rolling window of recent levels, rendered as a live scrolling waveform
-  // while recording — the clearest "yes, it's actually capturing sound"
-  // signal, much more so than a single numeric bar.
-  static const _liveHistoryLength = 120;
-  final List<double> _micHistory = [];
-  final List<double> _systemHistory = [];
-
-  void _pushLevel(List<double> history, double level) {
-    history.add(level);
-    if (history.length > _liveHistoryLength) {
-      history.removeAt(0);
-    }
-  }
 
   // Composite key "<recordingId>:<track>" (track is "mix"/"mic"/"system")
   // identifying which of the up-to-three tracks per recording is loaded.
@@ -87,9 +62,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _elapsedTimer?.cancel();
-    _micLevelSub?.cancel();
-    _systemLevelTimer?.cancel();
     _playerStateSub?.cancel();
     _playerPositionSub?.cancel();
     _player.dispose();
@@ -114,68 +86,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _toggleRecording() async {
-    setState(() => _error = null);
-    if (_isRecording) {
-      Log.i(_tag, 'user pressed stop');
-      _elapsedTimer?.cancel();
-      _micLevelSub?.cancel();
-      _systemLevelTimer?.cancel();
-      setState(() {
-        _isRecording = false;
-        _isProcessing = true;
-        _elapsed = Duration.zero;
-        _micLevel = 0;
-        _systemLevel = 0;
-        _micHistory.clear();
-        _systemHistory.clear();
-      });
-      try {
-        final path = await _session.stop();
-        Log.i(_tag, 'recording finalized at $path');
-      } catch (e, st) {
-        Log.e(_tag, 'stop() failed', e, st);
-        setState(() => _error = 'Не удалось свести запись: $e');
-      }
-      setState(() => _isProcessing = false);
-      await _refresh();
-      return;
-    }
-
-    Log.i(_tag, 'user pressed record');
-    try {
-      // start() itself requests every permission it needs and only begins
-      // writing once the user has answered; nothing is recorded before that.
-      await _session.start();
-      _micHistory.clear();
-      _systemHistory.clear();
-      setState(() => _isRecording = true);
-      if (!_session.systemAudioAvailable) {
-        setState(() => _error =
-            'Записываю только микрофон — доступ к записи экрана не выдан.');
-      }
-      _elapsedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        setState(() => _elapsed += const Duration(seconds: 1));
-      });
-      _micLevelSub = _session.micLevelStream().listen((level) {
-        setState(() {
-          _micLevel = level;
-          _pushLevel(_micHistory, level);
-        });
-      });
-      _systemLevelTimer = Timer.periodic(const Duration(milliseconds: 150), (_) async {
-        final level = await _session.systemLevel();
-        if (mounted) {
-          setState(() {
-            _systemLevel = level;
-            _pushLevel(_systemHistory, level);
-          });
-        }
-      });
-    } catch (e, st) {
-      Log.e(_tag, 'start() failed', e, st);
-      setState(() => _error = e.toString());
-    }
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _delete(Recording recording) async {
@@ -209,61 +121,9 @@ class _HomeScreenState extends State<HomeScreen> {
       await _player.play();
     } catch (e, st) {
       Log.e(_tag, 'playback failed for $path', e, st);
-      setState(() {
-        _playingKey = null;
-        _error = 'Не удалось воспроизвести запись: $e';
-      });
+      setState(() => _playingKey = null);
+      _showError('Не удалось воспроизвести запись: $e');
     }
-  }
-
-  Widget _liveTrackRow({
-    required String label,
-    required double level,
-    required List<double> history,
-    required Color color,
-  }) {
-    // A silent recording still needs to visibly prove it's capturing —
-    // a flat waveform reads as "broken", so a small pulsing dot next to
-    // the label confirms the pipeline is live even at zero level.
-    final isLive = level > 0.02;
-    return Row(
-      children: [
-        SizedBox(
-          width: 64,
-          child: Row(
-            children: [
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: isLive ? color : color.withValues(alpha: 0.25),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Text(label, style: Theme.of(context).textTheme.bodySmall),
-            ],
-          ),
-        ),
-        Expanded(
-          child: history.isEmpty
-              ? SizedBox(
-                  height: 32,
-                  child: Center(
-                    child: Text(
-                      '…',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(color: color.withValues(alpha: 0.5)),
-                    ),
-                  ),
-                )
-              : WaveformView(samples: history, height: 32, color: color),
-        ),
-      ],
-    );
   }
 
   Widget _trackChip({
@@ -302,71 +162,13 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.all(24),
-            child: Column(
-              children: [
-                if (_error != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: Text(
-                      _error!,
-                      style: TextStyle(color: Theme.of(context).colorScheme.error),
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                ElevatedButton.icon(
-                  onPressed: _isProcessing ? null : _toggleRecording,
-                  icon: _isProcessing
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : Icon(_isRecording ? Icons.stop : Icons.fiber_manual_record),
-                  label: Text(
-                    _isProcessing
-                        ? 'Свожу запись…'
-                        : _isRecording
-                            ? 'Стоп'
-                            : 'Записать',
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _isRecording ? Colors.red : null,
-                    foregroundColor: _isRecording ? Colors.white : null,
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                  ),
-                ),
-                if (_isRecording) ...[
-                  Padding(
-                    padding: const EdgeInsets.only(top: 12, bottom: 12),
-                    child: Text(
-                      _formatDuration(_elapsed),
-                      style: Theme.of(context).textTheme.headlineSmall,
-                    ),
-                  ),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 420),
-                    child: Column(
-                      children: [
-                        _liveTrackRow(
-                          label: 'Мик',
-                          level: _micLevel,
-                          history: _micHistory,
-                          color: Colors.deepPurple,
-                        ),
-                        if (_session.systemAudioAvailable) ...[
-                          const SizedBox(height: 10),
-                          _liveTrackRow(
-                            label: 'Система',
-                            level: _systemLevel,
-                            history: _systemHistory,
-                            color: Colors.teal,
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ],
+            child: RecordingIndicator(
+              session: _session,
+              onFinished: (path) {
+                Log.i(_tag, 'recording finalized at $path');
+                _refresh();
+              },
+              onProcessingChanged: (_) {},
             ),
           ),
           const Divider(height: 1),

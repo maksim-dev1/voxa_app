@@ -48,18 +48,25 @@ enum AudioMixer {
     let maxGain: Float = 8.0
 
     let micPeak = try peakAmplitude(of: micFile)
-    micFile.framePosition = 0
     let micGain = micPeak > 0.001 ? min(targetPeak / micPeak, maxGain) : 1.0
 
     var sysGain: Float = 1.0
     if let sysFile {
       let sysPeak = try peakAmplitude(of: sysFile)
-      sysFile.framePosition = 0
       sysGain = sysPeak > 0.001 ? min(targetPeak / sysPeak, maxGain) : 1.0
     }
     os_log(
       "mixDown: micPeak=%.3f micGain=%.2f sysGain=%.2f", log: log, type: .info, micPeak, micGain,
       sysGain)
+
+    // Re-open both files for the actual mixing pass rather than rewinding
+    // the handles used for the peak scan — cheap, and rules out any
+    // AVAudioFile read-position/state weirdness across the two passes.
+    let micFileForMixing = try AVAudioFile(forReading: micURL)
+    var sysFileForMixing: AVAudioFile?
+    if let systemPath, sysFile != nil {
+      sysFileForMixing = try AVAudioFile(forReading: URL(fileURLWithPath: systemPath))
+    }
 
     let outURL = URL(fileURLWithPath: outputPath)
     try? FileManager.default.removeItem(at: outURL)
@@ -74,31 +81,40 @@ enum AudioMixer {
       forWriting: outURL, settings: outputSettings, commonFormat: .pcmFormatFloat32,
       interleaved: false)
 
-    let micReader = TrackReader(file: micFile, targetFormat: commonFormat)
-    let sysReader = sysFile.map { TrackReader(file: $0, targetFormat: commonFormat) }
+    let micReader = TrackReader(file: micFileForMixing, targetFormat: commonFormat)
+    let sysReader = sysFileForMixing.map { TrackReader(file: $0, targetFormat: commonFormat) }
 
     let chunkFrames: AVAudioFrameCount = 4096
     var totalFramesWritten: Int64 = 0
     var chunkCount = 0
 
-    while true {
-      let micBuffer = try micReader.nextChunk(frameCount: chunkFrames)
-      let sysBuffer = try sysReader?.nextChunk(frameCount: chunkFrames)
+    do {
+      while true {
+        let micBuffer = try micReader.nextChunk(frameCount: chunkFrames)
+        let sysBuffer = try sysReader?.nextChunk(frameCount: chunkFrames)
 
-      if micBuffer == nil && (sysBuffer == nil || sysReader == nil) {
-        break
-      }
+        if micBuffer == nil && (sysBuffer == nil || sysReader == nil) {
+          break
+        }
 
-      let mixed = mix(
-        a: micBuffer, aGain: micGain, b: sysBuffer, bGain: sysGain, frameCount: chunkFrames,
-        format: commonFormat)
-      if mixed.frameLength > 0 {
-        try outputFile.write(from: mixed)
-        totalFramesWritten += Int64(mixed.frameLength)
-        chunkCount += 1
-      } else {
-        break
+        let mixed = mix(
+          a: micBuffer, aGain: micGain, b: sysBuffer, bGain: sysGain, frameCount: chunkFrames,
+          format: commonFormat)
+        if mixed.frameLength > 0 {
+          try outputFile.write(from: mixed)
+          totalFramesWritten += Int64(mixed.frameLength)
+          chunkCount += 1
+        } else {
+          break
+        }
       }
+    } catch {
+      let nsError = error as NSError
+      os_log(
+        "mixDown: failed at chunk %d (%d frames written so far): domain=%{public}@ code=%d %{public}@",
+        log: log, type: .error, chunkCount, totalFramesWritten, nsError.domain, nsError.code,
+        nsError.userInfo.description)
+      throw error
     }
     os_log(
       "mixDown: wrote %d chunks, %d frames (%.1fs) to %{public}@", log: log, type: .info,
