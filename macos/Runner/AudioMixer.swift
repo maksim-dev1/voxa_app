@@ -207,7 +207,14 @@ enum AudioMixer {
 
     var peak: Float = 0
     let channels = Int(file.processingFormat.channelCount)
-    while true {
+    let totalFrames = file.length
+    var framesRead: AVAudioFramePosition = 0
+
+    // AVAudioFile.read(into:frameCount:) throws once framePosition has
+    // already reached the end of the file, instead of returning 0 frames
+    // — so the loop must stop as soon as the known total is consumed,
+    // never issue one more "just in case" read past it.
+    while framesRead < totalFrames {
       buffer.frameLength = 0
       try file.read(into: buffer, frameCount: chunkFrames)
       let n = Int(buffer.frameLength)
@@ -218,6 +225,7 @@ enum AudioMixer {
           peak = max(peak, abs(data[i]))
         }
       }
+      framesRead += AVAudioFramePosition(n)
     }
     return peak
   }
