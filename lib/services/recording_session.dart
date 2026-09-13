@@ -124,9 +124,9 @@ class RecordingSession {
         systemPath: systemPath,
         outputPath: outputPath,
       );
-      await File(micPath).delete();
-      await File(systemPath).delete();
-      Log.i(_tag, 'mixdown complete, output=$outputPath');
+      // Keep the raw mic/system tracks around (not just the mix) so either
+      // side of the call can be played back separately.
+      Log.i(_tag, 'mixdown complete, output=$outputPath (raw tracks kept)');
     } else {
       // No second track to mix in — the mic recording already is the
       // final file, just move it into place.

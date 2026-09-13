@@ -42,7 +42,9 @@ class _HomeScreenState extends State<HomeScreen> {
   double _micLevel = 0;
   double _systemLevel = 0;
 
-  String? _playingId;
+  // Composite key "<recordingId>:<track>" (track is "mix"/"mic"/"system")
+  // identifying which of the up-to-three tracks per recording is loaded.
+  String? _playingKey;
   bool _playerBusy = false;
   Duration _playbackPosition = Duration.zero;
   Duration _playbackDuration = Duration.zero;
@@ -56,7 +58,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _playerStateSub = _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         setState(() {
-          _playingId = null;
+          _playingKey = null;
           _playerBusy = false;
           _playbackPosition = Duration.zero;
         });
@@ -152,17 +154,18 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _delete(Recording recording) async {
-    if (_playingId == recording.id) {
+    if (_playingKey?.startsWith('${recording.id}:') ?? false) {
       await _player.stop();
-      setState(() => _playingId = null);
+      setState(() => _playingKey = null);
     }
     await _repository.delete(recording);
     setState(() => _waveforms.remove(recording.id));
     await _refresh();
   }
 
-  Future<void> _togglePlay(Recording recording) async {
-    if (_playingId == recording.id) {
+  Future<void> _togglePlay(Recording recording, {required String track, required String path}) async {
+    final key = '${recording.id}:$track';
+    if (_playingKey == key) {
       if (_player.playing) {
         await _player.pause();
       } else {
@@ -172,20 +175,38 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     setState(() {
-      _playingId = recording.id;
+      _playingKey = key;
       _playbackPosition = Duration.zero;
     });
     try {
-      final duration = await _player.setFilePath(recording.path);
+      final duration = await _player.setFilePath(path);
       setState(() => _playbackDuration = duration ?? recording.duration);
       await _player.play();
     } catch (e, st) {
-      Log.e(_tag, 'playback failed for ${recording.path}', e, st);
+      Log.e(_tag, 'playback failed for $path', e, st);
       setState(() {
-        _playingId = null;
+        _playingKey = null;
         _error = 'Не удалось воспроизвести запись: $e';
       });
     }
+  }
+
+  Widget _trackChip({
+    required String label,
+    required Recording recording,
+    required String track,
+    required String path,
+  }) {
+    final key = '${recording.id}:$track';
+    final playing = _playingKey == key;
+    return ActionChip(
+      avatar: Icon(
+        playing && _playerBusy ? Icons.pause : Icons.play_arrow,
+        size: 18,
+      ),
+      label: Text(label),
+      onPressed: () => _togglePlay(recording, track: track, path: path),
+    );
   }
 
   String _formatDuration(Duration d) {
@@ -272,9 +293,10 @@ class _HomeScreenState extends State<HomeScreen> {
                         itemCount: _recordings.length,
                         itemBuilder: (context, index) {
                           final r = _recordings[index];
-                          final playing = _playingId == r.id;
+                          final mixKey = '${r.id}:mix';
+                          final playingMix = _playingKey == mixKey;
                           final waveform = _waveforms[r.id];
-                          final progress = playing && _playbackDuration.inMilliseconds > 0
+                          final progress = playingMix && _playbackDuration.inMilliseconds > 0
                               ? _playbackPosition.inMilliseconds /
                                   _playbackDuration.inMilliseconds
                               : null;
@@ -286,12 +308,14 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ListTile(
                                   leading: IconButton(
                                     icon: Icon(
-                                      playing && _playerBusy
+                                      playingMix && _playerBusy
                                           ? Icons.pause_circle_filled
                                           : Icons.play_circle_fill,
                                     ),
                                     iconSize: 32,
-                                    onPressed: () => _togglePlay(r),
+                                    tooltip: 'Свод (мик + система)',
+                                    onPressed: () =>
+                                        _togglePlay(r, track: 'mix', path: r.path),
                                   ),
                                   title: Text(DateFormat('d MMM, HH:mm').format(r.startedAt)),
                                   subtitle: Text(_formatDuration(r.duration)),
@@ -301,11 +325,35 @@ class _HomeScreenState extends State<HomeScreen> {
                                   ),
                                 ),
                                 Padding(
-                                  padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
+                                  padding: const EdgeInsets.only(left: 16, right: 16, bottom: 4),
                                   child: waveform == null
                                       ? const SizedBox(height: 36)
                                       : WaveformView(samples: waveform, progress: progress),
                                 ),
+                                if (r.micPath != null || r.systemPath != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
+                                    child: Row(
+                                      children: [
+                                        if (r.micPath != null)
+                                          _trackChip(
+                                            label: 'Мик',
+                                            recording: r,
+                                            track: 'mic',
+                                            path: r.micPath!,
+                                          ),
+                                        if (r.micPath != null && r.systemPath != null)
+                                          const SizedBox(width: 8),
+                                        if (r.systemPath != null)
+                                          _trackChip(
+                                            label: 'Система',
+                                            recording: r,
+                                            track: 'system',
+                                            path: r.systemPath!,
+                                          ),
+                                      ],
+                                    ),
+                                  ),
                               ],
                             ),
                           );

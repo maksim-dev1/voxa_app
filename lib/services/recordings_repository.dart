@@ -5,10 +5,10 @@ import 'package:path_provider/path_provider.dart';
 import '../models/recording.dart';
 
 /// Owns the on-disk layout for recordings: one folder per session under
-/// `<app documents>/voxa_recordings/<timestamp>/`. During recording it holds
-/// raw mic.m4a / system.m4a; once mixed down, only recording.m4a remains
-/// (the raw tracks are deleted) — that's the single file the rest of the
-/// app deals with.
+/// `<app documents>/voxa_recordings/<timestamp>/`, holding recording.m4a
+/// (the mix, what plays by default) alongside the raw mic.m4a / system.m4a
+/// it was built from — kept around so either side of a call can be played
+/// back separately.
 class RecordingsRepository {
   Future<Directory> _rootDir() async {
     final docs = await getApplicationDocumentsDirectory();
@@ -49,12 +49,17 @@ class RecordingsRepository {
         int.tryParse(id) ?? 0,
       );
 
+      final micFile = File(rawMicPath(dir));
+      final systemFile = File(rawSystemPath(dir));
+
       result.add(
         Recording(
           id: id,
           startedAt: startedAt,
           path: file.path,
           duration: Duration(milliseconds: await _estimateDurationMs(file)),
+          micPath: await micFile.exists() ? micFile.path : null,
+          systemPath: await systemFile.exists() ? systemFile.path : null,
         ),
       );
     }
