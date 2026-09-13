@@ -6,6 +6,7 @@ class Recording {
     required this.duration,
     this.micPath,
     this.systemPath,
+    this.jobId,
   });
 
   final String id;
@@ -22,4 +23,8 @@ class Recording {
   /// Raw system-only track. Null when the recording was mic-only (no
   /// screen-recording permission) or the file was cleaned up.
   final String? systemPath;
+
+  /// Server-side transcription job id, once this recording has been
+  /// uploaded. Null until the user sends it.
+  final String? jobId;
 }

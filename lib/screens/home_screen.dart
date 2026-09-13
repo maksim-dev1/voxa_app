@@ -5,17 +5,24 @@ import 'package:intl/intl.dart';
 import 'package:just_audio/just_audio.dart';
 
 import '../models/recording.dart';
+import '../models/transcription_job.dart';
+import '../services/api_client.dart';
+import '../services/auth_service.dart';
 import '../services/logger.dart';
 import '../services/recording_session.dart';
 import '../services/recordings_repository.dart';
 import '../services/system_audio_recorder.dart';
 import '../widgets/recording_indicator.dart';
 import '../widgets/waveform_view.dart';
+import 'transcript_screen.dart';
 
 const _tag = 'HomeScreen';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({super.key, required this.auth, required this.api});
+
+  final AuthService auth;
+  final ApiClient api;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -28,7 +35,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Recording> _recordings = [];
   final Map<String, List<double>> _waveforms = {};
+  // Recording id -> latest known job (status + error), separate from
+  // Recording.jobId which is just the id persisted on disk.
+  final Map<String, TranscriptionJob> _jobs = {};
+  final Set<String> _uploading = {};
   bool _loading = true;
+
+  Timer? _pollTimer;
 
   // Composite key "<recordingId>:<track>" (track is "mix"/"mic"/"system")
   // identifying which of the up-to-three tracks per recording is loaded.
@@ -58,10 +71,12 @@ class _HomeScreenState extends State<HomeScreen> {
     _playerPositionSub = _player.positionStream.listen((pos) {
       setState(() => _playbackPosition = pos);
     });
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pollPendingJobs());
   }
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     _playerStateSub?.cancel();
     _playerPositionSub?.cancel();
     _player.dispose();
@@ -84,6 +99,30 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() => _waveforms[r.id] = wf);
       });
     }
+    unawaited(_pollPendingJobs());
+  }
+
+  /// Checks status for every recording that has a job but isn't known to
+  /// be done/failed yet. Cheap no-op when nothing is pending.
+  Future<void> _pollPendingJobs() async {
+    final token = widget.auth.token;
+    if (token == null) return;
+
+    for (final r in _recordings) {
+      final jobId = r.jobId;
+      if (jobId == null) continue;
+      final known = _jobs[r.id];
+      if (known != null && known.status != JobStatus.queued && known.status != JobStatus.processing) {
+        continue;
+      }
+      try {
+        final job = await widget.api.getJob(token, jobId);
+        if (!mounted) return;
+        setState(() => _jobs[r.id] = job);
+      } catch (e, st) {
+        Log.e(_tag, 'failed to poll job $jobId', e, st);
+      }
+    }
   }
 
   void _showError(String message) {
@@ -96,7 +135,10 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _playingKey = null);
     }
     await _repository.delete(recording);
-    setState(() => _waveforms.remove(recording.id));
+    setState(() {
+      _waveforms.remove(recording.id);
+      _jobs.remove(recording.id);
+    });
     await _refresh();
   }
 
@@ -126,6 +168,43 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _upload(Recording recording) async {
+    final token = widget.auth.token;
+    if (token == null) return;
+
+    setState(() => _uploading.add(recording.id));
+    try {
+      final jobId = await widget.api.uploadRecording(token, recording.path);
+      await _repository.saveJobId(recording, jobId);
+      if (!mounted) return;
+      setState(() => _jobs[recording.id] = TranscriptionJob(id: jobId, status: JobStatus.queued));
+      await _refresh();
+    } on NetworkException catch (e) {
+      _showError(e.toString());
+    } on ApiException catch (e) {
+      Log.w(_tag, 'upload failed: $e');
+      _showError('Не удалось отправить запись: ${e.message}');
+    } finally {
+      if (mounted) setState(() => _uploading.remove(recording.id));
+    }
+  }
+
+  Future<void> _openTranscript(Recording recording, String jobId) async {
+    final token = widget.auth.token;
+    if (token == null) return;
+    try {
+      final segments = await widget.api.getResult(token, jobId);
+      if (!mounted) return;
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => TranscriptScreen(segments: segments)),
+      );
+    } on NetworkException catch (e) {
+      _showError(e.toString());
+    } on ApiException catch (e) {
+      _showError('Не удалось загрузить транскрипт: ${e.message}');
+    }
+  }
+
   Widget _trackChip({
     required String label,
     required Recording recording,
@@ -144,6 +223,54 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _transcriptionStatus(Recording recording) {
+    final uploading = _uploading.contains(recording.id);
+    if (uploading) {
+      return const Chip(
+        avatar: SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        label: Text('Отправляю…'),
+      );
+    }
+
+    final job = _jobs[recording.id];
+    if (job == null) {
+      return ActionChip(
+        avatar: const Icon(Icons.cloud_upload_outlined, size: 18),
+        label: const Text('На транскрипцию'),
+        onPressed: () => _upload(recording),
+      );
+    }
+
+    switch (job.status) {
+      case JobStatus.queued:
+      case JobStatus.processing:
+        return Chip(
+          avatar: const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          label: Text(job.status == JobStatus.queued ? 'В очереди…' : 'Обрабатывается…'),
+        );
+      case JobStatus.done:
+        return ActionChip(
+          avatar: const Icon(Icons.description_outlined, size: 18),
+          label: const Text('Транскрипт'),
+          onPressed: () => _openTranscript(recording, job.id),
+        );
+      case JobStatus.failed:
+        return ActionChip(
+          avatar: Icon(Icons.error_outline, size: 18, color: Theme.of(context).colorScheme.error),
+          label: const Text('Ошибка'),
+          onPressed: () => _showError(job.error ?? 'Транскрипция не удалась'),
+        );
+    }
+  }
+
   String _formatDuration(Duration d) {
     final h = d.inHours;
     final m = d.inMinutes.remainder(60);
@@ -157,7 +284,16 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('voxa')),
+      appBar: AppBar(
+        title: const Text('voxa'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Выйти',
+            onPressed: widget.auth.logout,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Padding(
@@ -218,30 +354,30 @@ class _HomeScreenState extends State<HomeScreen> {
                                       ? const SizedBox(height: 36)
                                       : WaveformView(samples: waveform, progress: progress),
                                 ),
-                                if (r.micPath != null || r.systemPath != null)
-                                  Padding(
-                                    padding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
-                                    child: Row(
-                                      children: [
-                                        if (r.micPath != null)
-                                          _trackChip(
-                                            label: 'Мик',
-                                            recording: r,
-                                            track: 'mic',
-                                            path: r.micPath!,
-                                          ),
-                                        if (r.micPath != null && r.systemPath != null)
-                                          const SizedBox(width: 8),
-                                        if (r.systemPath != null)
-                                          _trackChip(
-                                            label: 'Система',
-                                            recording: r,
-                                            track: 'system',
-                                            path: r.systemPath!,
-                                          ),
-                                      ],
-                                    ),
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
+                                  child: Wrap(
+                                    spacing: 8,
+                                    runSpacing: 4,
+                                    children: [
+                                      if (r.micPath != null)
+                                        _trackChip(
+                                          label: 'Мик',
+                                          recording: r,
+                                          track: 'mic',
+                                          path: r.micPath!,
+                                        ),
+                                      if (r.systemPath != null)
+                                        _trackChip(
+                                          label: 'Система',
+                                          recording: r,
+                                          track: 'system',
+                                          path: r.systemPath!,
+                                        ),
+                                      _transcriptionStatus(r),
+                                    ],
                                   ),
+                                ),
                               ],
                             ),
                           );

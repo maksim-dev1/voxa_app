@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
@@ -30,6 +31,25 @@ class RecordingsRepository {
   String rawMicPath(Directory sessionDir) => '${sessionDir.path}/mic.m4a';
   String rawSystemPath(Directory sessionDir) => '${sessionDir.path}/system.m4a';
   String finalPath(Directory sessionDir) => '${sessionDir.path}/recording.m4a';
+  String _jobMetaPath(Directory sessionDir) => '${sessionDir.path}/job.json';
+
+  /// Persists the server job id for a recording so it survives an app
+  /// restart — upload status isn't re-derivable from the audio file alone.
+  Future<void> saveJobId(Recording recording, String jobId) async {
+    final dir = File(recording.path).parent;
+    await File(_jobMetaPath(dir)).writeAsString(jsonEncode({'job_id': jobId}));
+  }
+
+  Future<String?> _loadJobId(Directory sessionDir) async {
+    final file = File(_jobMetaPath(sessionDir));
+    if (!await file.exists()) return null;
+    try {
+      final data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      return data['job_id'] as String?;
+    } catch (_) {
+      return null;
+    }
+  }
 
   Future<List<Recording>> listRecordings() async {
     final root = await _rootDir();
@@ -60,6 +80,7 @@ class RecordingsRepository {
           duration: Duration(milliseconds: await _estimateDurationMs(file)),
           micPath: await micFile.exists() ? micFile.path : null,
           systemPath: await systemFile.exists() ? systemFile.path : null,
+          jobId: await _loadJobId(dir),
         ),
       );
     }
