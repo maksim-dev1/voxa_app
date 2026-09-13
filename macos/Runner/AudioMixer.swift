@@ -39,6 +39,28 @@ enum AudioMixer {
         sysFile.length, sysFile.processingFormat.description)
     }
 
+    // System audio is usually captured much hotter than the mic input, so
+    // a plain sample sum leaves the mic barely audible. Measure each
+    // track's peak first and normalize both to a common target level
+    // before mixing, so voice and system audio come out comparably loud
+    // regardless of source gain differences.
+    let targetPeak: Float = 0.85
+    let maxGain: Float = 8.0
+
+    let micPeak = try peakAmplitude(of: micFile)
+    micFile.framePosition = 0
+    let micGain = micPeak > 0.001 ? min(targetPeak / micPeak, maxGain) : 1.0
+
+    var sysGain: Float = 1.0
+    if let sysFile {
+      let sysPeak = try peakAmplitude(of: sysFile)
+      sysFile.framePosition = 0
+      sysGain = sysPeak > 0.001 ? min(targetPeak / sysPeak, maxGain) : 1.0
+    }
+    os_log(
+      "mixDown: micPeak=%.3f micGain=%.2f sysGain=%.2f", log: log, type: .info, micPeak, micGain,
+      sysGain)
+
     let outURL = URL(fileURLWithPath: outputPath)
     try? FileManager.default.removeItem(at: outURL)
 
@@ -68,7 +90,8 @@ enum AudioMixer {
       }
 
       let mixed = mix(
-        a: micBuffer, b: sysBuffer, frameCount: chunkFrames, format: commonFormat)
+        a: micBuffer, aGain: micGain, b: sysBuffer, bGain: sysGain, frameCount: chunkFrames,
+        format: commonFormat)
       if mixed.frameLength > 0 {
         try outputFile.write(from: mixed)
         totalFramesWritten += Int64(mixed.frameLength)
@@ -135,8 +158,8 @@ enum AudioMixer {
   }
 
   private static func mix(
-    a: AVAudioPCMBuffer?, b: AVAudioPCMBuffer?, frameCount: AVAudioFrameCount,
-    format: AVAudioFormat
+    a: AVAudioPCMBuffer?, aGain: Float, b: AVAudioPCMBuffer?, bGain: Float,
+    frameCount: AVAudioFrameCount, format: AVAudioFormat
   ) -> AVAudioPCMBuffer {
     let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
     let length = max(a?.frameLength ?? 0, b?.frameLength ?? 0)
@@ -148,12 +171,39 @@ enum AudioMixer {
       let aData = a?.floatChannelData?[ch]
       let bData = b?.floatChannelData?[ch]
       for frame in 0..<Int(length) {
-        let av = (aData != nil && frame < Int(a!.frameLength)) ? aData![frame] : 0
-        let bv = (bData != nil && frame < Int(b!.frameLength)) ? bData![frame] : 0
+        let av = (aData != nil && frame < Int(a!.frameLength)) ? aData![frame] * aGain : 0
+        let bv = (bData != nil && frame < Int(b!.frameLength)) ? bData![frame] * bGain : 0
         outData[frame] = max(-1.0, min(1.0, av + bv))
       }
     }
     return out
+  }
+
+  /// Scans a whole file and returns its peak absolute sample value
+  /// (0...1), used to normalize track loudness before mixing. Leaves the
+  /// file's read position at the end — callers must reset it to 0 before
+  /// reading again.
+  private static func peakAmplitude(of file: AVAudioFile) throws -> Float {
+    let chunkFrames: AVAudioFrameCount = 4096
+    guard
+      let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunkFrames)
+    else { return 0 }
+
+    var peak: Float = 0
+    let channels = Int(file.processingFormat.channelCount)
+    while true {
+      buffer.frameLength = 0
+      try file.read(into: buffer, frameCount: chunkFrames)
+      let n = Int(buffer.frameLength)
+      if n == 0 { break }
+      for ch in 0..<channels {
+        guard let data = buffer.floatChannelData?[ch] else { continue }
+        for i in 0..<n {
+          peak = max(peak, abs(data[i]))
+        }
+      }
+    }
+    return peak
   }
 }
 
