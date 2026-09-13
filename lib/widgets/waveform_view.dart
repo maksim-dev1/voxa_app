@@ -3,7 +3,13 @@ import 'package:flutter/material.dart';
 /// Static peak-amplitude waveform, drawn as a bar chart from precomputed
 /// 0..1 samples (see SystemAudioRecorder.extractWaveform).
 class WaveformView extends StatelessWidget {
-  const WaveformView({super.key, required this.samples, this.height = 36, this.progress});
+  const WaveformView({
+    super.key,
+    required this.samples,
+    this.height = 36,
+    this.progress,
+    this.color,
+  });
 
   final List<double> samples;
   final double height;
@@ -11,12 +17,16 @@ class WaveformView extends StatelessWidget {
   /// 0..1 playback progress; painted bars before this point are highlighted.
   final double? progress;
 
+  /// Overrides the theme's primary color, e.g. to match a per-track color
+  /// (mic vs system) in a live meter.
+  final Color? color;
+
   @override
   Widget build(BuildContext context) {
     if (samples.isEmpty) {
       return SizedBox(height: height);
     }
-    final color = Theme.of(context).colorScheme.primary;
+    final color = this.color ?? Theme.of(context).colorScheme.primary;
     return SizedBox(
       height: height,
       width: double.infinity,
